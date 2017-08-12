@@ -1,0 +1,16 @@
+go: &go
+  image: golang
+  working_dir: /go/src/github.com/nexdrew/cockroachdb-driver
+  volumes:
+    - $GOPATH:/go
+go-test:
+  <<: *go
+  command: sh -c 'go get -t -v ./... && go test -p=1 -v ./...'
+  links:
+    - cockroach
+cockroach:
+  image: cockroachdb/cockroach:v1.0.4
+  ports:
+    - "26257:26257"
+    - "8080:8080"
+  command: "start --insecure"
