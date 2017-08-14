@@ -9,6 +9,7 @@ import (
   "strings"
   "hash/crc32"
   "context"
+  "errors"
 
   "github.com/db-journey/migrate/direction"
   "github.com/db-journey/migrate/driver"
@@ -39,6 +40,7 @@ type Config struct {
 type Driver struct {
   db     *sql.DB
   config *Config
+  lockId string
 }
 
 const txDisabledOption = "disable_ddl_transaction" // this is a neat feature
@@ -89,19 +91,23 @@ func (driver *Driver) Initialize(url string) error {
     return err
   }
 
-  return nil
+  return lock(driver)
 }
 
 // SetDB replaces the current database handle.
 func (driver *Driver) SetDB(db *sql.DB) {
   // fmt.Println("SetDB")
-  driver.db = db
+  // driver.db = db
 }
 
 // Close closes the database handle.
 func (driver *Driver) Close() error {
   // fmt.Println("Close")
-  return driver.db.Close()
+  if driver.lockId == "" {
+    return driver.db.Close()
+  }
+  defer driver.db.Close()
+  return unlock(driver)
 }
 
 // FilenameExtension returns "sql".
@@ -109,17 +115,10 @@ func (driver *Driver) FilenameExtension() string {
   return "sql"
 }
 
-// Migrate performs the migration of any one file.
-func (driver *Driver) Migrate(f file.File, pipe chan interface{}) {
-  defer close(pipe)
-  var err error
-  var aid string
-  pipe <- f
-
-  // (1) acquire lock, (2) read file, (3) apply script, (4) insert version, (5) release lock
-  // fmt.Println("Migrate: acquire lock, start")
-  err = crdb.ExecuteTx(context.Background(), driver.db, nil, func(tx *sql.Tx) error {
-    aid, err = GenerateAdvisoryLockId(driver.config.DatabaseName)
+func lock(driver *Driver) error {
+  // fmt.Println("Initialize: acquire lock, start")
+  return crdb.ExecuteTx(context.Background(), driver.db, nil, func(tx *sql.Tx) error {
+    aid, err := GenerateAdvisoryLockId(driver.config.DatabaseName)
     if err != nil {
       return err
     }
@@ -127,55 +126,69 @@ func (driver *Driver) Migrate(f file.File, pipe chan interface{}) {
     query := `SELECT * FROM "` + driver.config.LockTable + `" WHERE lock_id = $1`
     rows, err := tx.Query(query, aid)
     if err != nil {
-      return Error{OrigErr: err, Err: "failed to fetch migration lock", Query: []byte(query)}
+      return Error{OrigErr: err, Err: "Failed to fetch migration lock", Query: []byte(query)}
     }
     defer rows.Close()
 
     // If row exists at all, lock is present
     locked := rows.Next()
     if locked && !driver.config.ForceLock {
-      return Error{Err: "lock could not be acquired; already locked", Query: []byte(query)}
+      return Error{Err: "Lock could not be acquired; already locked", Query: []byte(query)}
     }
 
     query = `INSERT INTO "` + driver.config.LockTable + `" (lock_id) VALUES ($1)`
     if _, err := tx.Exec(query, aid) ; err != nil {
-      return Error{OrigErr: err, Err: "failed to set migration lock", Query: []byte(query)}
+      return Error{OrigErr: err, Err: "Failed to set migration lock", Query: []byte(query)}
     }
 
-    // fmt.Println("Migrate: acquire lock, finish")
+    driver.lockId = aid
+
+    // fmt.Println("Initialize: acquire lock, finish")
     return nil
   })
+}
 
-  if err != nil {
-    pipe <- err
+func unlock(driver *Driver) error {
+  if driver.lockId == "" {
+    return nil
+  }
+  // fmt.Println("Close: release lock, start:", driver.lockId)
+  query := `DELETE FROM "` + driver.config.LockTable + `" WHERE lock_id = $1`
+  if _, err := driver.db.Exec(query, driver.lockId); err != nil {
+    if e, ok := err.(*pq.Error); ok {
+      // 42P01 is "UndefinedTableError" in CockroachDB
+      // https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/pgwire/pgerror/codes.go
+      if e.Code == "42P01" {
+        // On drops, the lock table is fully removed;  This is fine, and is a valid "unlocked" state for the schema
+        // fmt.Println("Migrate: release lock, finish with expected error")
+        return nil
+      }
+    }
+    return Error{OrigErr: err, Err: "failed to release migration lock", Query: []byte(query)}
+  }
+  // fmt.Println("Close: release lock, finish")
+  return nil
+}
+
+// Migrate performs the migration of any one file.
+func (driver *Driver) Migrate(f file.File, pipe chan interface{}) {
+  defer close(pipe)
+  var err error
+  // var aid string
+  pipe <- f
+
+  if driver.lockId == "" {
+    pipe <- errors.New("Lock has not been acquired, cannot perform migration: " + f.FileName)
     return
   }
 
-  // defer anonymous function to release manual lock
-  defer func() {
-    // fmt.Println("Migrate: release lock, start:", aid)
-    query := `DELETE FROM "` + driver.config.LockTable + `" WHERE lock_id = $1`
-    if _, err := driver.db.Exec(query, aid); err != nil {
-      if e, ok := err.(*pq.Error); ok {
-        // 42P01 is "UndefinedTableError" in CockroachDB
-        // https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/pgwire/pgerror/codes.go
-        if e.Code == "42P01" {
-          // On drops, the lock table is fully removed;  This is fine, and is a valid "unlocked" state for the schema
-          // fmt.Println("Migrate: release lock, finish with expected error")
-          return
-        }
-      }
-      pipe <- Error{OrigErr: err, Err: "failed to release migration lock", Query: []byte(query)}
-      return
-    }
-    // fmt.Println("Migrate: release lock, finish")
-    return
-  }()
-
+  // (1) read file, (2) apply script, (3) insert version
+  // fmt.Println("Migrate: read file, start: " + f.FileName)
   if err = f.ReadContent(); err != nil {
     pipe <- err
     return
   }
+  // fmt.Println("Migrate: read file, finish: " + f.FileName)
 
   // cockroach v1 does not allow schema changes and other writes within the same transaction
   // so apply the migration first, in a tx unless explicitly opt-out
@@ -233,7 +246,7 @@ func (driver *Driver) Migrate(f file.File, pipe chan interface{}) {
 
   if err != nil {
     pipe <- err
-    return
+    // return
   }
   // fmt.Println("Migrate: update version, finish")
 }
@@ -277,8 +290,9 @@ func (driver *Driver) Versions() (file.Versions, error) {
 // Execute a SQL statement
 func (driver *Driver) Execute(statement string) error {
   // fmt.Println("Execute:", statement)
-  _, err := driver.db.Exec(statement)
-  return err
+  // _, err := driver.db.Exec(statement)
+  // return err
+  return errors.New("Execute method not supported")
 }
 
 // == INTERFACE METHODS: END ===================================================
