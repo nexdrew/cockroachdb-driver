@@ -233,7 +233,7 @@ func (driver *Driver) Migrate(f file.File, pipe chan interface{}) {
   // fmt.Println("Migrate: update version, start")
   err = crdb.ExecuteTx(context.Background(), driver.db, nil, func(tx *sql.Tx) error {
     if f.Direction == direction.Up {
-      if _, err = tx.Exec(`INSERT INTO "` + driver.config.MigrationsTable + `" (version) VALUES ($1)`, f.Version); err != nil {
+      if _, err = tx.Exec(`INSERT INTO "` + driver.config.MigrationsTable + `" (version, name) VALUES ($1, $2)`, f.Version, f.Name); err != nil {
         return err
       }
     } else if f.Direction == direction.Down {
@@ -329,7 +329,7 @@ func (driver *Driver) ensureVersionTable() error {
   }
 
   // if not, create the empty migration table
-  query = `CREATE TABLE IF NOT EXISTS "` + driver.config.MigrationsTable + `" (version BIGINT NOT NULL PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP())`
+  query = `CREATE TABLE IF NOT EXISTS "` + driver.config.MigrationsTable + `" (version BIGINT NOT NULL PRIMARY KEY, name STRING(255) NOT NULL, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP())`
   if _, err := driver.db.Exec(query); err != nil {
     return &Error{OrigErr: err, Query: []byte(query)}
   }
